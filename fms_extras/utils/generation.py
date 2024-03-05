@@ -12,6 +12,120 @@ from fms_extras.models.speculator import (
 )
 from fms_extras.utils.cache.paged import PagedAttentionCacheData, PagedKVCacheManager
 
+def speculative_generate2(
+    model: Union[Callable, torch.nn.Module],
+    input_ids: Union[torch.Tensor, List[torch.Tensor]],
+    kv_cache_manager: PagedKVCacheManager,
+    max_seq_len: int = 2048,
+    new_tokens: int = 256,
+):
+    bsize = len(input_ids)
+
+    result = input_ids  # [b] n
+    # Build padded batched input tensor
+    max_len = max([seq.size(0) for seq in input_ids])
+    n_pads_init = [max_len - seq.size(0) for seq in input_ids]
+    n_pads = torch.tensor(n_pads_init).to(device=input_ids[0].device, dtype=torch.int)
+    inputs = torch.stack(
+        [F.pad(input_ids[i], (n_pads_init[i], 0)) for i in range(bsize)]
+    )
+    num_tokens_per_sequence = torch.count_nonzero(inputs[:, :-1].T, dim=0).tolist()
+    cache_data: PagedAttentionCacheData = kv_cache_manager.allocate_tokens(
+        num_tokens_per_sequence
+    )
+    parent_sequence_ids = cache_data.sequence_ids
+    # Build padded causal mask
+    mask = torch.ones(
+        bsize,
+        1,
+        inputs.size(1) - 1,
+        inputs.size(1) - 1,
+        device=inputs.device,
+    )
+    mask = mask.tril()  # b 1 n-1 n-1
+    # Mask off any left-pads
+    pad_mask = torch.arange(mask.size(3), device=mask.device).view(
+        1, 1, 1, -1
+    )  # 1 1 1 n-1
+    pad_mask = pad_mask.expand(bsize, 1, 1, -1)  # b 1 1 n-1
+    pad_mask = pad_mask.sub(n_pads.sub(1).view(-1, 1, 1, 1)).clamp(0, 1)
+    eye = torch.eye(mask.size(3), device=mask.device)[None, None, :, :]  # 1 1 n-1 n-1
+    mask = mask.mul(pad_mask).logical_or(eye).log()  # b 1 n-1 n-1
+
+    # Build kv cache and get initial state vector
+    n_adds = model.config.n_predict + 1
+    inputs = inputs[:, -max_seq_len + n_adds:]
+    position_ids = cache_data.compute_position_ids(num_tokens_per_sequence)
+
+    _, embeds = model(
+        inputs[:, :-1],
+        position_ids=position_ids,
+        mask=mask,
+        cache_data=cache_data,
+        use_cache=True
+    )
+    embeds = embeds[:, -1:]
+
+    n_gen = torch.zeros(bsize, device=inputs.device, dtype=torch.int)
+    n_steps = 0
+    input_ids = inputs[:, -1:]
+    start_time = time.time()
+    while min(n_gen) < new_tokens:
+        n_steps += 1
+
+        # create candidate sequences
+        child_sequence_ids_list = []
+        child_sequence_ids_flattened = []
+        num_tokens_per_sequence = [n_adds for _ in range(input_ids.size(0) * top_k)]
+        # each parent will have top_k child sequences
+        for parent_sequence_id in parent_sequence_ids:
+            child_sequence_ids = kv_cache_manager.add_child_sequences(
+                parent_sequence_id, top_k
+            )
+            child_sequence_ids_list.append(child_sequence_ids)
+            child_sequence_ids_flattened.extend(child_sequence_ids)
+
+        # add n_adds tokens to each candidate
+        cache_data = kv_cache_manager.allocate_tokens(
+            num_tokens_per_sequence, child_sequence_ids_flattened
+        )
+        position_ids = cache_data.compute_position_ids(num_tokens_per_sequence)
+        next_vals_split, _, embeds, best_guess, n_correct = model(
+            input_ids=input_ids,
+            embeds=embeds,
+            position_ids=position_ids,
+            cache_data=cache_data,
+            use_cache=True,
+        )
+
+        # free all worst candidates and keep best candidates as parents
+        parent_sequence_ids = []
+        for parent_index, child_sequence_ids in enumerate(child_sequence_ids_list):
+            best_index = int(best_guess[parent_index].item())
+
+            # free all bad candidates
+            kv_cache_manager.free_sequences(
+                child_sequence_ids[:best_index] + child_sequence_ids[best_index + 1:]
+            )
+
+            # decrease the context length of the sequence which used to be sequence length + n_adds by the number of incorrect tokens
+            # for the correct candidate
+            best_sequence_id = child_sequence_ids[best_index]
+            parent_sequence_ids.append(best_sequence_id)
+            kv_cache_manager.remove_tokens(
+                best_sequence_id, n_adds - n_correct[parent_index].item() - 1
+            )
+
+        # Update results
+        result = [
+            torch.cat((result[i], next_vals_split[i]), dim=0) for i in range(bsize)
+        ]
+        input_ids = torch.stack([line[-1:] for line in next_vals_split], dim=0)  # b 1
+
+    kv_cache_manager.free_sequences(parent_sequence_ids, recursive=True)
+    end_time = time.time()
+    return result, n_steps, (end_time - start_time)
+
 
 def speculative_generate(
     model: Union[Callable, torch.nn.Module],

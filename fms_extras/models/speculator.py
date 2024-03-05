@@ -1,3 +1,4 @@
+import dataclasses
 import math
 from typing import List, Tuple
 
@@ -261,3 +262,13 @@ def flatten_batch(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.
         ind_out,
         torch.tensor(ind_flat, device=ind_out.device, dtype=torch.int32),
     )
+
+# @dataclasses.dataclass
+# class SpeculativeOutput:
+#
+#     embeds: torch.Tensor
+#     cache: List[Tuple[torch.Tensor, torch.Tensor]]
+#
+# @dataclasses.dataclass
+# class PrefillSpeculativeOutput(SpeculativeOutput):
+

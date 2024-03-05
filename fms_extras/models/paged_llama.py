@@ -3,7 +3,7 @@ import math
 import os
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Mapping, MutableMapping, Optional, Tuple, Union
 
@@ -31,6 +31,7 @@ from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
 from torch._C._distributed_c10d import ProcessGroup
 
+from fms_extras.models.speculator import MLPSpeculator, flatten_batch, select_inflate_dim
 from fms_extras.utils.cache.paged import (
     PagedAttentionCacheData,
     PagedAttentionCacheDataLayer,
