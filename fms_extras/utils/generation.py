@@ -33,47 +33,29 @@ def speculative_generate2(
     kv_cache_manager: PagedKVCacheManager,
     max_seq_len: int = 2048,
     new_tokens: int = 256,
+    decode_model: Optional[Union[Callable, torch.nn.Module]] = None,
 ):
+    if decode_model is None:
+        decode_model = model
+
     bsize = len(input_ids)
     top_k = model.config.top_k
 
     result = input_ids  # [b] n
     mask, inputs = __create_prefill_mask_and_prompts(input_ids)
-    # Build padded batched input tensor
-    # max_len = max([seq.size(0) for seq in input_ids])
-    # n_pads_init = [max_len - seq.size(0) for seq in input_ids]
-    # n_pads = torch.tensor(n_pads_init).to(device=input_ids[0].device, dtype=torch.int)
-    # inputs = torch.stack(
-    #     [F.pad(input_ids[i], (n_pads_init[i], 0)) for i in range(bsize)]
-    # )
+
     num_tokens_per_sequence = [seq.size(0)-1 for seq in input_ids]
     cache_data: PagedAttentionCacheData = kv_cache_manager.allocate_tokens(
         num_tokens_per_sequence
     )
     parent_sequence_ids = cache_data.sequence_ids
-    # Build padded causal mask
-    # mask = torch.ones(
-    #     bsize,
-    #     1,
-    #     inputs.size(1) - 1,
-    #     inputs.size(1) - 1,
-    #     device=inputs.device,
-    # )
-    # mask = mask.tril()  # b 1 n-1 n-1
-    # # Mask off any left-pads
-    # pad_mask = torch.arange(mask.size(3), device=mask.device).view(
-    #     1, 1, 1, -1
-    # )  # 1 1 1 n-1
-    # pad_mask = pad_mask.expand(bsize, 1, 1, -1)  # b 1 1 n-1
-    # pad_mask = pad_mask.sub(n_pads.sub(1).view(-1, 1, 1, 1)).clamp(0, 1)
-    # eye = torch.eye(mask.size(3), device=mask.device)[None, None, :, :]  # 1 1 n-1 n-1
-    # mask = mask.mul(pad_mask).logical_or(eye).log()  # b 1 n-1 n-1
 
     # Build kv cache and get initial state vector
     n_adds = model.config.n_predict + 1
     inputs = inputs[:, -max_seq_len + n_adds:]
     position_ids = cache_data.compute_position_ids(num_tokens_per_sequence)
 
+    # prefill
     embeds, _ = model(
         inputs[:, :-1],
         position_ids=position_ids,
@@ -107,7 +89,8 @@ def speculative_generate2(
             num_tokens_per_sequence, child_sequence_ids_flattened
         )
         position_ids = cache_data.compute_position_ids(num_tokens_per_sequence)
-        next_vals_split, _, embeds, best_guess, n_correct = model(
+        # decode
+        next_vals_split, _, embeds, best_guess, n_correct = decode_model(
             input_ids=input_ids,
             embeds=embeds,
             position_ids=position_ids,

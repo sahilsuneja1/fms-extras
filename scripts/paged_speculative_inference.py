@@ -207,6 +207,7 @@ def infer(ids, warmup):
         kv_cache_manager=kv_cache_manager,
         new_tokens=100,
         max_seq_len=model.config.max_expected_seq_len,
+        decode_model=decode_model,
     )
     # else:
     #     result, n_steps, generated_token_time_out = paged_generate(
@@ -234,13 +235,16 @@ if args.compile:
     torch._inductor.config.joint_graph_constant_folding = False
     # compiling can make first inference pass slow
     decode_model = model
-    decode_model = torch.compile(decode_model, mode=compile_mode, fullgraph=True)
+    decode_model.headless_model = torch.compile(decode_model.headless_model, mode=compile_mode, fullgraph=True)
+    decode_model.speculator_head.generate_suffixes = torch.compile(decode_model.speculator_head.generate_suffixes, mode=compile_mode, fullgraph=True)
+    decode_model.lm_head = torch.compile(decode_model.lm_head, mode=compile_mode, fullgraph=True)
+
     model = torch.compile(model, fullgraph=True, dynamic=True)
-    if speculator:
-        speculator = torch.compile(speculator, mode=compile_mode)
-        speculator.generate_suffixes = torch.compile(
-            speculator.generate_suffixes, mode=compile_mode
-        )
+    # if speculator:
+    #     speculator = torch.compile(speculator, mode=compile_mode)
+    #     speculator.generate_suffixes = torch.compile(
+    #         speculator.generate_suffixes, mode=compile_mode
+    #     )
 
 template = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{}\n\n### Response:"
 
