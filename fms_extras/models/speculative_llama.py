@@ -7,7 +7,7 @@ from fms.distributed.strategy import DistributedStrategy, NoOpStrategy
 from fms import models
 from fms.utils import serialization
 
-from fms_extras.models.paged_llama import PagedLLaMAConfig, PagedLLaMAHeadless
+from fms_extras.models.paged_llama import PagedLLaMAConfig, PagedLLaMAHeadless, PagedLLaMA
 import torch.nn as nn
 import torch
 from fms_extras.models.speculator import MLPSpeculator, select_inflate_dim, flatten_batch
@@ -27,6 +27,8 @@ class SpeculativeLLaMA(nn.Module):
 
     def __init__(
         self,
+        model: PagedLLaMA,
+        speculator: MLPSpeculator,
         config: Optional[SpeculativeLLaMAConfig] = None,
         distributed_strategy: DistributedStrategy = NoOpStrategy,
         **kwargs,
@@ -36,19 +38,13 @@ class SpeculativeLLaMA(nn.Module):
             self.config = config
         else:
             self.config = SpeculativeLLaMAConfig()
+        self.config = self.config.updated(**model.config.as_dict())
         self.config = self.config.updated(**kwargs)
         self.distributed_strategy = distributed_strategy
 
-        self.headless_model = PagedLLaMAHeadless(self.config, distributed_strategy)
-
-        self.speculator_head = MLPSpeculator(
-            self.config.emb_dim,
-            self.config.inner_dim,
-            self.config.src_vocab_size,
-            self.config.n_predict
-        )
-        self.lm_head = self.headless_model.shared.head
-        self.reset_params()
+        self.headless_model = model.headless_model
+        self.speculator_head = speculator
+        self.lm_head = model.head
 
     def forward(
         self,
@@ -64,7 +60,7 @@ class SpeculativeLLaMA(nn.Module):
         # assume this is always used for inference
         if not cache_data.is_filled():
             return self.headless_model(
-                input_ids=input_ids,
+                x_in=input_ids,
                 position_ids=position_ids,
                 mask=mask,
                 cache_data=cache_data,
@@ -132,14 +128,14 @@ class SpeculativeLLaMA(nn.Module):
                 input_ids = flat_inputs
 
             embeds, cache = self.headless_model(
-                input_ids=input_ids,
+                x_in=input_ids,
                 position_ids=position_ids,
                 cache_data=cache_data,
                 use_cache=use_cache,
                 attn_algorithm=attn_algorithm
             )
 
-            logits = self.lm_head(embeds)
+            logits = self.lm_head(embeds, reverse=True)
             next_vals = torch.argmax(logits, dim=-1)  # 1 n'
 
             if this_flatting:

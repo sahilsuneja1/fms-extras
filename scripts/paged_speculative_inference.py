@@ -11,8 +11,8 @@ from torch import distributed as dist
 
 import fms_extras.models.paged_llama
 from fms_extras.models.speculator import MLPSpeculator
-from fms_extras.utils.generation import paged_generate, speculative_generate
-
+from fms_extras.utils.generation import paged_generate, speculative_generate, speculative_generate2
+from fms_extras.models.speculative_llama import SpeculativeLLaMA
 
 # This example script validates the LLaMA implementation by running inference on a couple of prompts.
 # torchrun --nproc_per_node=1 scripts/inference.py --variant=7b --model_path=~/models/7B-F --tokenizer=~/models/tokenizer.model --model_source=meta --speculator_path=~/models/speculator_7B_F.pth --compile
@@ -150,6 +150,7 @@ if args.speculator_path is not None:
     speculator = speculator.to(device)
     print("loading complete on rank", local_rank)
 
+    model = SpeculativeLLaMA(model, speculator).to(torch.half)
 print("initializing paged cache")
 # cache setup
 from fms_extras.utils.cache.paged import PagedKVCacheManager
@@ -199,30 +200,25 @@ def infer(ids, warmup):
 
     cudagraphs = compile_mode == "reduce-overhead"
 
-    if speculator:
-        result, n_steps, generated_token_time_out = speculative_generate(
-            model,
-            ids,
-            speculator,
-            kv_cache_manager,
-            new_tokens=100,
-            max_seq_len=model.config.max_expected_seq_len,
-            decode_model=decode_model,
-            # todo: we can only reduce-overhead for now when batch size is 1
-            flatting=not (args.compile and compile_mode == "reduce-overhead"),
-            cudagraphs=cudagraphs,
-        )
-    else:
-        result, n_steps, generated_token_time_out = paged_generate(
-            model,
-            ids,
-            kv_cache_manager,
-            max_new_tokens=100,
-            max_seq_len=model.config.max_expected_seq_len,
-            do_sample=False,
-            decode_model=decode_model,
-            cudagraphs=cudagraphs,
-        )
+    # if speculator:
+    result, n_steps, generated_token_time_out = speculative_generate2(
+        model=model,
+        input_ids=ids,
+        kv_cache_manager=kv_cache_manager,
+        new_tokens=100,
+        max_seq_len=model.config.max_expected_seq_len,
+    )
+    # else:
+    #     result, n_steps, generated_token_time_out = paged_generate(
+    #         model,
+    #         ids,
+    #         kv_cache_manager,
+    #         max_new_tokens=100,
+    #         max_seq_len=model.config.max_expected_seq_len,
+    #         do_sample=False,
+    #         decode_model=decode_model,
+    #         cudagraphs=cudagraphs,
+    #     )
     if not warmup:
         total_tokens = 0
         for i in range(len(result)):
