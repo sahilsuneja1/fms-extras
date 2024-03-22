@@ -303,7 +303,7 @@ _santacoder_config = PagedGPTBigCodeConfig(
 )
 
 _13b_config = PagedGPTBigCodeConfig(src_vocab_size=50304, emb_dim=5632, nheads=44, nlayers=40, pad_id=50280, max_pos=8192, hidden_grow_factor=4., p_dropout=0.1, emb_dropout=0.1, ln_eps=1e-5)
-_20b_config = PagedGPTBigCodeConfig(src_vocab_size=49152, emb_dim=6144, nheads=52, nlayers=48, pad_id=0, max_pos=32768, hidden_grow_factor=4., p_dropout=0.1, emb_dropout=0.1, ln_eps=1e-5)
+_20b_config = PagedGPTBigCodeConfig(src_vocab_size=49152, emb_dim=6144, nheads=48, nlayers=52, pad_id=0, max_pos=8192, hidden_grow_factor=4., p_dropout=0.1, emb_dropout=0.1, ln_eps=1e-5)
 
 
 _architecture_name = "paged_gpt_bigcode"
