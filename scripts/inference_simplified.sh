@@ -61,10 +61,23 @@ MODEL_ARGS_GRANITE3B="\
 "
 #--speculator_path="/gpfs/prangan/ckpts/granite_3b_stage1/checkpoints/step_21001_ckp.pth"
 
+MODEL_ARGS_GRANITE3B_HF="\
+--variant="calico.3b.code"
+--model_path="/gpfs/prangan/hub/models--ibm-granite--granite-3b-code-instruct/snapshots/4420bfb5a3361ab4714bbd653848ef1a819d9f5b/"
+--tokenizer="/gpfs/prangan/hub/models--ibm-granite--granite-3b-code-instruct/snapshots/4420bfb5a3361ab4714bbd653848ef1a819d9f5b/"
+--model_source=hf
+--speculator_source=hf
+--architecture=llama
+--prompt_type="code"
+--speculator_path="/gpfs/suneja/checkpoints/granite-3b/checkpoints/granite-3b-code-instruct/accelerator"
+--speculator_variant=430m
+--speculator_source=hf
+--top_k_tokens_per_head=6,5,4,3,3
+"
 
 export CUDA_VISIBLE_DEVICES=1
 
 torchrun \
     --nproc_per_node=1 \
     scripts/paged_speculative_inference_new.py \
-    ${MODEL_ARGS_GRANITE8B}
+    ${MODEL_ARGS_GRANITE3B_HF}

@@ -291,6 +291,12 @@ _calico_8b_test = {
     "inner_dim": 4096,
 }
 
+_calico_3b_code = {
+    "emb_dim": 2560,
+    "vocab_size": 49152,
+    "n_predict": 5,
+    "inner_dim": 4096,
+}
 _architecture_name = "mlp_speculator"
 
 
@@ -333,6 +339,12 @@ models.register_model(
     _architecture_name,
     "llama.calico.8b.code.2_1b",
     _mlp_speculator_factory_factory(_calico_8b_test),
+)
+
+models.register_model(
+    _architecture_name,
+    "llama.calico.3b.code.430m",
+    _mlp_speculator_factory_factory(_calico_3b_code),
 )
 
 
