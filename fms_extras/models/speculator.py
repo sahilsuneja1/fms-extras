@@ -13,7 +13,8 @@ class MLPSpeculatorLayer(nn.Module):
     def __init__(self, in_dim, out_dim, vsize, state_weight):
         super().__init__()
         self.emb = nn.Embedding(vsize, out_dim)
-        self.proj = nn.Linear(in_dim, out_dim)
+        #self.proj = nn.Linear(in_dim, out_dim)
+        self.proj = nn.Linear(in_dim, out_dim, bias=False)
         self.head = nn.Linear(out_dim, vsize, bias=False)
         self.ln = LayerNormParameterized(out_dim, elementwise_shift=True, elementwise_scale=True)
         self.state_weight = state_weight
@@ -24,8 +25,10 @@ class MLPSpeculatorLayer(nn.Module):
         
     def reset_parameters(self):
         for m in ["emb", "head"]:
-            nn.init.trunc_normal_(getattr(self, m).weight, 0, 1 / math.sqrt(self.d))
-        nn.init.trunc_normal_(self.proj.weight, 0, 1 / math.sqrt(self.proj.weight.size(1)))
+            #nn.init.trunc_normal_(getattr(self, m).weight, 0, 1 / math.sqrt(self.d))
+            nn.init.normal_(getattr(self, m).weight, 0, 1 / math.sqrt(self.d))
+        #nn.init.trunc_normal_(self.proj.weight, 0, 1 / math.sqrt(self.proj.weight.size(1)))
+        nn.init.normal_(self.proj.weight, 0, 1 / math.sqrt(self.proj.weight.size(1)))
         self.ln.weight.data.fill_(1)
         self.ln.bias.data.zero_()
         
