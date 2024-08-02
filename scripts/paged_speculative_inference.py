@@ -175,7 +175,7 @@ model = get_model(
     checkpoint_sharding=args.checkpoint_sharding,
     device_type=args.device_type,
     source=args.model_source,
-    #distributed_strategy='fsdp',
+    distributed_strategy='fsdp',
     #distributed_strategy=distr_param,
     #group=dist.group.WORLD,
 )

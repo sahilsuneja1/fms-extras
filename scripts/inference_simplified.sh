@@ -235,11 +235,26 @@ MODEL_ARGS_LLAMA2_70B_HF="\
 --speculator_source=hf
 --speculator_load_type=hf_remote
 --top_k_tokens_per_head=4,3,2,2
+--batch_input
 "
 
+MODEL_ARGS_LLAMA3_70B_SPECU2_CONVERTED_HF="\
+--variant="llama3.70b"
+--model_path="/gpfs/llama3/hf/70b_instruction_tuned"
+--tokenizer="/gpfs/llama3/hf/70b_instruction_tuned"
+--model_source=hf
+--architecture=llama
+--speculator_path="/gpfs/suneja/models/llama3-70b-accelerator"
+--speculator_source=hf
+--speculator_load_type=hf_remote
+--top_k_tokens_per_head=4,3,2,2
+--batch_input
+"
+#--speculator_path="/gpfs/suneja/checkpoints/llama3-70b-specu2-wtinitfix/checkpoints/70b_instruction_tuned/accelerator"
 
-export CUDA_VISIBLE_DEVICES=1
+
+#export CUDA_VISIBLE_DEVICES=1
 torchrun \
-    --nproc_per_node=1 \
+    --nproc_per_node=8 \
     scripts/paged_speculative_inference.py \
-    ${MODEL_ARGS_GRANITE13B_HF}
+    ${MODEL_ARGS_LLAMA3_70B_SPECU2_CONVERTED_HF}
