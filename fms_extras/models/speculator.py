@@ -179,6 +179,7 @@ class MLPSpeculator(nn.Module):
         self,
         state: torch.Tensor,
         inds: torch.Tensor,
+        plen: int = 0,
     ) -> torch.Tensor:
         """
         FOR TRAINING
@@ -196,18 +197,26 @@ class MLPSpeculator(nn.Module):
             Ground-truth token indices. inds[:,i] is the prediction coming from state[:,i]
             (or the legal fiction ground truth corresponding to that prediction).
             Expects size [b n+self.n_predict+1].
+        plen : int
+            Ignore the first plen tokens of each line when calculating loss
+            (avoids training the speculator on templated prompts).
         ...
         Output : torch.Tensor
             Aggregate prediction losses for each head of the speculator.
             Has size [self.n_predict].
         """
         out = []
+        if plen == 0:
+            targ = inds
+        else:
+            targ = inds.clone()
+            targ[:,:plen] = -100
         state = self.ln0(state) / 2**.5
         for i in range(self.n_predict):
             loss, state = self.heads[i](
                 state, 
                 inds[:, i : i + state.size(1)],
-                inds[:, i + 1 : i + 1 + state.size(1)],
+                targ[:, i + 1 : i + 1 + state.size(1)],
             )  # 1, b n d
             out.append(loss)
         return torch.stack(out, dim=0)  # h
