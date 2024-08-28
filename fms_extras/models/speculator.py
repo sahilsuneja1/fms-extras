@@ -72,6 +72,9 @@ class MLPSpeculator(nn.Module):
     tie_weights : bool
         If true, use a single set of weights for every model head/stage after the first.
         The initial projection from the base model may have a different size, so that stays separate.
+    plen : int
+        Ignore the first plen tokens of each line when calculating training loss
+        (avoids training the speculator on templated prompts).
     """
 
     def __init__(
@@ -81,6 +84,7 @@ class MLPSpeculator(nn.Module):
         vocab_size=32000,
         n_predict=3,
         tie_weights=True,
+        plen=0,
     ):
         super().__init__()
         self.ln0 = LayerNormParameterized(emb_dim, elementwise_shift=False, elementwise_scale=False)
@@ -91,6 +95,7 @@ class MLPSpeculator(nn.Module):
             ]
         )
         self.n_predict = n_predict
+        self.plen = plen
 
         # Handle weight tying as specified
         if tie_weights:
@@ -179,7 +184,6 @@ class MLPSpeculator(nn.Module):
         self,
         state: torch.Tensor,
         inds: torch.Tensor,
-        plen: int = 0,
     ) -> torch.Tensor:
         """
         FOR TRAINING
@@ -197,20 +201,16 @@ class MLPSpeculator(nn.Module):
             Ground-truth token indices. inds[:,i] is the prediction coming from state[:,i]
             (or the legal fiction ground truth corresponding to that prediction).
             Expects size [b n+self.n_predict+1].
-        plen : int
-            Ignore the first plen tokens of each line when calculating loss
-            (avoids training the speculator on templated prompts).
         ...
         Output : torch.Tensor
             Aggregate prediction losses for each head of the speculator.
             Has size [self.n_predict].
         """
         out = []
-        if plen == 0:
-            targ = inds
-        else:
+        targ = inds
+        if self.plen != 0:
             targ = inds.clone()
-            targ[:,:plen] = -100
+            targ[:,:self.plen] = -100
         state = self.ln0(state) / 2**.5
         for i in range(self.n_predict):
             loss, state = self.heads[i](
