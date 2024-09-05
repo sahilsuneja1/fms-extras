@@ -473,6 +473,32 @@ models.register_model(
     _llama_factory_factory((_8b_calico_code_config)),
 )
 
+
+_8b_128k_calico_code_config = PagedLLaMAConfig(
+    src_vocab_size=49152,
+    emb_dim=4096,
+    kvheads=8,
+    nlayers=36,
+    nheads=32,
+    pad_id=0,
+    hidden_grow_factor=14336 / 4096,
+    multiple_of=1,
+    p_dropout=0.1,
+    max_expected_seq_len=128000,
+    attn_bias=True,
+    mlp_bias=True,
+    tie_heads=True,
+    activation_fn="silu",
+    rope_theta=10000000
+)
+
+models.register_model(
+    _architecture_name,
+    "calico.8b.128k.code",
+    _llama_factory_factory((_8b_128k_calico_code_config)),
+)
+
+
 _3b_calico_code_config = PagedLLaMAConfig(
     src_vocab_size=49152,
     emb_dim=2560,
