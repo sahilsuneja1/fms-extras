@@ -484,6 +484,7 @@ models.register_model(
 
 models.register_model(
     _architecture_name, "llama3.70b", _llama_factory_factory((_70b_llama3_config))
+)
 
 # calico
 
