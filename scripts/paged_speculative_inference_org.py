@@ -3,7 +3,6 @@ import itertools
 import os
 import time
 
-import transformers
 import torch
 import torch._inductor.config
 from fms.models import get_model
@@ -121,14 +120,6 @@ parser.add_argument(
     default="chat",
     help="type of prompts to be used, either chat or code",
 )
-parser.add_argument(
-    "--speculator_load_type",
-    type=str,
-    choices=["singlefile", "registered_local", "hf_remote"],
-    default="singlefile",
-    help="how to load the speculator",
-)
-
 args = parser.parse_args()
 
 if args.batch_input and args.compile and args.compile_mode == "reduce-overhead":
@@ -154,9 +145,11 @@ torch.set_default_dtype(torch.bfloat16)
 if args.deterministic:
     torch.use_deterministic_algorithms(True)
 
-if True:
+if args.distributed:
     dist.init_process_group()
+    torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
 
+print("loading model")
 if args.distributed:
     distr_param = "tp"
 else:
@@ -165,7 +158,6 @@ else:
     else:
         distr_param = None
 
-print("loading model")
 model = get_model(
     f"paged_{args.architecture}",
     args.variant,
@@ -173,9 +165,8 @@ model = get_model(
     checkpoint_sharding=args.checkpoint_sharding,
     device_type=args.device_type,
     source=args.model_source,
-    distributed_strategy='fsdp',
-    #distributed_strategy=distr_param,
-    #group=dist.group.WORLD,
+    distributed_strategy=distr_param,
+    group=dist.group.WORLD,
 )
 decode_model = None
 
@@ -183,74 +174,34 @@ tokenizer = tokenizers.get_tokenizer(args.tokenizer)
 model.eval()
 torch.set_grad_enabled(False)
 speculator = None
-
 if args.speculator_path is not None:
     print("loading speculator")
     # todo: handling of remote weights in get_model
     #is_local = os.path.exists(args.speculator_path) or args.speculator_source != "hf"
-    if args.speculator_load_type == "singlefile": #manual
-        print("loading speculator singlefile")
-        speculator = MLPSpeculator(
-            #model.config.emb_dim, 4096, model.config.src_vocab_size, n_predict=4
-            model.config.emb_dim, 6144, model.config.src_vocab_size, n_predict=5, tie_wts=True, scale_input=True
-            #tie_emb=True, tie_head=True, tie_transition=True, scale_input=True,
-        )
-        speculator.load_state_dict(
-            torch.load(args.speculator_path, map_location=device)["model_state"]
-        )
-    elif args.speculator_load_type == "registered_local":
-        print("loading speculator registered local")
-        speculator = get_model(
-            "mlp_speculator",
-            f"{args.architecture}.{args.variant}.{args.speculator_variant}",
-            model_path=args.speculator_path,
-            source=args.speculator_source,
-            device_type=args.device_type,
-        )
-    elif args.speculator_load_type == "hf_remote":
-        print("loading speculator HF remote")
+    #if is_local:
+    #    speculator = get_model(
+    #        "mlp_speculator",
+    #        f"{args.architecture}.{args.variant}.{args.speculator_variant}",
+    #        model_path=args.speculator_path,
+    #        source=args.speculator_source,
+    #        device_type=args.device_type,
+    #    )
+    #else:
+    if True:
         from fms_extras.models.hf.modeling_mlp_speculator import (
-            MLPSpeculatorPreTrainedModel, MLPSpeculatorConfig
+            MLPSpeculatorPreTrainedModel,
         )
-        
+
         speculator = MLPSpeculatorPreTrainedModel.from_pretrained(
             args.speculator_path, #device_map=args.device_type
         ).speculator
-
-
-        #config = MLPSpeculatorConfig.from_pretrained(args.speculator_path)
-        #speculator =  MLPSpeculatorPreTrainedModel(config)
-        #speculator.load_state_dict(
-        #    transformers.modeling_utils.load_state_dict(args.speculator_path + '/pytorch_model.bin'),
-        #    strict=False)
-        #speculator = speculator.speculator
-
-    else:
-        print("Incorrect speculator_load_type")
-        exit(1)
-
-    if local_rank == 0:
-        total_params = sum(
-            p.numel() for p in speculator.parameters() if p.requires_grad
-        )
-        print(f"\nspeculator has {total_params / 1e6} Million params\n")        
-        #print([i for i,j in speculator.named_parameters()])
-        #print(torch.cuda.memory_summary())
-        #exit(0)
     speculator = speculator.to(device)
-    if local_rank == 0:
-        total_params = sum(
-            p.numel() for p in speculator.parameters() if p.requires_grad
-        )
-        print(f"\nspeculator has {total_params / 1e6} Million params\n")        
-
     if len(args.top_k_tokens_per_head) != speculator.n_predict:
         print(
             "length of top_k_tokens_per_head must be equal to the speculator's number of heads (n_predict)"
         )
         exit()
     print("loading complete on rank", local_rank)
-
 
 print("initializing paged cache")
 # cache setup
@@ -271,7 +222,6 @@ kv_cache_manager = PagedKVCacheManager(
     tensor_parallel_size=dist.get_world_size() if args.distributed else 1,
     dtype=torch.get_default_dtype(),
     device=device,
-    total_num_gpu_blocks=2000,
 )
 print("cache initialization complete on rank", local_rank)
 
@@ -322,7 +272,7 @@ def infer(ids, warmup):
             decode_model=decode_model,
             # todo: we can only reduce-overhead for now when batch size is 1
             flattening=not (args.compile and compile_mode == "reduce-overhead"),
-            #cudagraphs=cudagraphs,
+            cudagraphs=cudagraphs,
             threshes=args.top_k_tokens_per_head,
         )
     else:

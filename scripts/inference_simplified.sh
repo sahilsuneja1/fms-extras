@@ -259,15 +259,38 @@ MODEL_ARGS_LLAMA3_8B_HF="\
 --tokenizer="/gpfs/llama3/hf/8b_instruction_tuned"
 --model_source=hf
 --architecture=llama
+--speculator_path="/gpfs/suneja/models/llama3-8b-accelerator"
 --speculator_variant=3_2b
 --speculator_source=hf
 --speculator_load_type=hf_remote
 --top_k_tokens_per_head=4,3,2,2
 "
-#--speculator_path="/gpfs/suneja/models/llama3-8b-accelerator"
 
-#export CUDA_VISIBLE_DEVICES=1
-torchrun \
-    --nproc_per_node=8 \
-    scripts/paged_speculative_inference.py \
-    ${MODEL_ARGS_LLAMA3_8B_HF}
+MODEL_ARGS_LLAMA3_8B_HF_TP="\
+--variant="llama3.8b"
+--model_path="/gpfs/llama3/hf/8b_instruction_tuned"
+--tokenizer="/gpfs/llama3/hf/8b_instruction_tuned"
+--model_source=hf
+--architecture=llama
+--speculator_path="/gpfs/suneja/models/llama3-8b-accelerator"
+--speculator_variant=3_2b
+--speculator_source=hf
+--speculator_load_type=hf_remote
+--top_k_tokens_per_head=4,3,2,2
+--distributed
+"
+
+TP=1
+if [ $TP -eq 1 ]
+then
+    torchrun \
+        --nproc_per_node=8 \
+        scripts/paged_speculative_inference_tp.py \
+        ${MODEL_ARGS_LLAMA3_8B_HF_TP}
+else
+    #export CUDA_VISIBLE_DEVICES=4
+    torchrun \
+        --nproc_per_node=8 \
+        scripts/paged_speculative_inference.py \
+        ${MODEL_ARGS_LLAMA3_8B_HF}
+fi        
