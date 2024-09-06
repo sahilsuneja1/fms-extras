@@ -24,6 +24,7 @@ from fms.modules.tp import TPModule
 from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
+from fms.utils.serialization import _legacy_mlp_glu_unfused_to_fused_adapter
 from torch._C._distributed_c10d import ProcessGroup
 
 from fms_extras.modules.attention import PagedMultiHeadAttention
@@ -56,6 +57,9 @@ class PagedLLaMAConfig(ModelConfig):
     max_expected_seq_len: int = 4096
     ntk_scaling: bool = False
     rope_theta: int = 10_000
+    attn_bias: bool = False
+    mlp_bias: bool = False
+    tie_heads: bool = False
 
 
 class PagedLLaMABlock(nn.Module):
@@ -95,7 +99,7 @@ class PagedLLaMABlock(nn.Module):
             self.config.nheads,
             kvheads,
             p_dropout=self.config.p_dropout,
-            use_bias=False,
+            use_bias=self.config.attn_bias,
             position_encoder=rotary_emb,
         )
         self.ff_sub_layer = GatedLinearUnit(
@@ -104,7 +108,7 @@ class PagedLLaMABlock(nn.Module):
             multiple_of=self.config.multiple_of,
             activation_fn=str_to_activation(self.config.activation_fn),
             p_dropout=self.config.p_dropout,
-            use_bias=False,
+            use_bias=self.config.mlp_bias,
         )
 
         if self.config.p_dropout != 0:
@@ -170,7 +174,7 @@ class PagedLLaMAHeadless(nn.Module):
             padding_idx=self.config.pad_id,
             abs_pos=False,
             reversible=True,
-            tie_weights=False,
+            tie_weights=self.config.tie_heads,
             bias=False,
         )
         self.shared = self.distributed_strategy.distribute_module(shared)
@@ -480,6 +484,49 @@ models.register_model(
 
 models.register_model(
     _architecture_name, "llama3.70b", _llama_factory_factory((_70b_llama3_config))
+
+# calico
+
+_8b_calico_code_config = PagedLLaMAConfig(
+    src_vocab_size=49152,
+    emb_dim=4096,
+    nheads=32,
+    kvheads=8,
+    nlayers=36,
+    pad_id=0,
+    hidden_grow_factor=14336 / 4096,
+    multiple_of=1,
+    max_expected_seq_len=4096,
+    attn_bias=True,
+    mlp_bias=True,
+    tie_heads=True,
+)
+
+models.register_model(
+    _architecture_name,
+    "calico.8b.code",
+    _llama_factory_factory((_8b_calico_code_config)),
+)
+
+_3b_calico_code_config = PagedLLaMAConfig(
+    src_vocab_size=49152,
+    emb_dim=2560,
+    nheads=32,
+    kvheads=32,
+    nlayers=32,
+    pad_id=0,
+    hidden_grow_factor=10240 / 2560,
+    multiple_of=1,
+    max_expected_seq_len=2048,
+    attn_bias=True,
+    mlp_bias=True,
+    tie_heads=True,
+)
+
+models.register_model(
+    _architecture_name,
+    "calico.3b.code",
+    _llama_factory_factory((_3b_calico_code_config)),
 )
 
 
@@ -523,6 +570,8 @@ def _rename_weights_to_fms(orig_sd):
                 re.sub(r"attn.(query|key|value)", "attn.qkv_fused", new_name)
             ] = torch.cat([orig_sd[w] for w in unfused_weights], dim=0)
 
+    new_sd = _legacy_mlp_glu_unfused_to_fused_adapter(new_sd)
+
     return new_sd
 
 
@@ -555,7 +604,7 @@ def _hf_sd_to_fms_sd(hf_sd: Mapping) -> Mapping:
             "attn.query" in new_name
             or "attn.key" in new_name
             or "attn.value" in new_name
-        ):
+        ) and "weight" in new_name:
             del new_sd[new_name]
             unfused_weights = [
                 re.sub(r"self_attn\.[kvq]_proj", "self_attn.q_proj", name),
@@ -573,10 +622,17 @@ def _hf_sd_to_fms_sd(hf_sd: Mapping) -> Mapping:
             # q=0, k=1
             for unfused_weight_key in unfused_weights[:2]:
                 temp = raw_mapping[unfused_weight_key]
+
+                emb_dim = param.size(1)
+                if emb_dim == 2560:
+                    head_size = 80
+                else:
+                    head_size = 128
+
                 # nheads is used in the transformation required for hf->fms
                 # here we are using 128 as this value fits with all popular models
                 #   7B, 13B, 70B to recover the number of heads
-                nheads = int(temp.size(0) / 128)
+                nheads = int(temp.size(0) / head_size)
 
                 temp = (
                     temp.view(nheads, 2, -1, temp.size(1))
@@ -589,36 +645,64 @@ def _hf_sd_to_fms_sd(hf_sd: Mapping) -> Mapping:
             new_sd[
                 re.sub(r"attn.(query|key|value)", "attn.qkv_fused", new_name)
             ] = torch.cat([raw_mapping[w] for w in unfused_weights], dim=0)
-
-    return new_sd
-
-
-def _rename_fms_weights_to_fms_paged(orig_sd):
-    new_sd = {}
-    for name, param in orig_sd.items():
-        new_name = f"headless_model.{name}"
-        new_sd[new_name] = param
-
-        # llama in meta has unfused qkv attn weights, so these weights must be converted to fused weights in fms
-        if (
+        elif (
             "attn.query" in new_name
             or "attn.key" in new_name
             or "attn.value" in new_name
-        ):
+        ) and "bias" in new_name:
+            del new_sd[new_name]
             unfused_weights = [
-                re.sub(r"attn.(query|key|value)", "attn.query", name),
-                re.sub(r"attn.(query|key|value)", "attn.key", name),
-                re.sub(r"attn.(query|key|value)", "attn.value", name),
+                re.sub(r"self_attn\.[kvq]_proj", "self_attn.q_proj", name),
+                re.sub(r"self_attn\.[kvq]_proj", "self_attn.k_proj", name),
+                re.sub(r"self_attn\.[kvq]_proj", "self_attn.v_proj", name),
             ]
-            missing_weights = [w for w in unfused_weights if w not in orig_sd.keys()]
+            missing_weights = [w for w in unfused_weights if w not in hf_sd.keys()]
             if len(missing_weights) != 0:
                 raise ValueError(
                     f"The following weights are required for properly fusing: {missing_weights}"
                 )
 
+            raw_mapping = {w: hf_sd[w] for w in unfused_weights}
+
+            # q=0, k=1
+            for unfused_weight_key in unfused_weights[:2]:
+                temp = raw_mapping[unfused_weight_key]
+
+                weight_name = name.replace("bias", "weight")
+                emb_dim = hf_sd[weight_name].size(1)
+                if emb_dim == 2560:
+                    head_size = 80
+                else:
+                    head_size = 128
+
+                # nheads is used in the transformation required for hf->fms
+                # here we are using 128 as this value fits with all popular models
+                #   7B, 13B, 70B to recover the number of heads
+                nheads = int(temp.size(0) / head_size)
+
+                temp = temp.view(nheads, 2, -1).transpose(1, 2).reshape(*temp.size())
+
+                raw_mapping[unfused_weight_key] = temp
+
             new_sd[
                 re.sub(r"attn.(query|key|value)", "attn.qkv_fused", new_name)
-            ] = torch.cat([orig_sd[w] for w in unfused_weights], dim=0)
+            ] = torch.cat([raw_mapping[w] for w in unfused_weights], dim=0)
+
+    new_sd = _legacy_mlp_glu_unfused_to_fused_adapter(new_sd)
+
+    return new_sd
+
+
+def _rename_fms_weights_to_fms_paged(orig_sd):
+    replacements = [
+        (r"attn\.in_proj\.qkv_fused\.weight", "attn.qkv_fused.weight"),
+    ]
+    new_sd = {}
+    for name, param in orig_sd.items():
+        new_name = f"headless_model.{name}"
+        for pattern, repl in replacements:
+            new_name = re.sub(pattern, repl, new_name)
+        new_sd[new_name] = param
 
     return new_sd
 
