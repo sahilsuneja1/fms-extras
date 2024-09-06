@@ -157,7 +157,7 @@ if args.deterministic:
 #if args.distributed:
 if True:
     dist.init_process_group()
-    #torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
+    torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
 
 if args.distributed:
     distr_param = "tp"

@@ -266,8 +266,8 @@ MODEL_ARGS_LLAMA3_8B_HF="\
 "
 #--speculator_path="/gpfs/suneja/models/llama3-8b-accelerator"
 
-export CUDA_VISIBLE_DEVICES=1
+#export CUDA_VISIBLE_DEVICES=1
 torchrun \
-    --nproc_per_node=1 \
+    --nproc_per_node=8 \
     scripts/paged_speculative_inference.py \
     ${MODEL_ARGS_LLAMA3_8B_HF}
