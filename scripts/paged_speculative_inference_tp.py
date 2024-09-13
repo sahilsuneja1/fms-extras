@@ -156,16 +156,8 @@ if args.deterministic:
 
 if args.distributed:
 #if True:
-    #dist.init_process_group()
-    #torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
-    tp_size = 8
-    base_model_mesh = dist.device_mesh.init_device_mesh(
-        "cuda", (world_size // tp_size, tp_size), mesh_dim_names=("dp", "tp")
-    )
-    speculator_mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
-    torch._C._distributed_c10d._register_process_group(
-        "default", base_model_mesh["tp"].get_group()
-    )
+    dist.init_process_group()
+    torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
 
 if args.distributed:
     distr_param = "tp"
@@ -185,8 +177,7 @@ model = get_model(
     source=args.model_source,
     #distributed_strategy='fsdp',
     distributed_strategy=distr_param,
-    #group=dist.group.WORLD,
-    group=base_model_mesh['tp'].get_group() if distr_param == 'tp' else None,
+    group=dist.group.WORLD,
 )
 decode_model = None
 
