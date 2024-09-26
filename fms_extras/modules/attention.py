@@ -32,6 +32,7 @@ class PagedMultiHeadAttention(nn.Module):
         p_dropout=None,
         use_bias=False,
         position_encoder: Optional[PositionEncoder] = None,
+        scale_factor: Optional[float] = None,
         gain=1,
     ):
         super(PagedMultiHeadAttention, self).__init__()
@@ -42,6 +43,7 @@ class PagedMultiHeadAttention(nn.Module):
         self.emb_v_per_head = emb_v
         self.p_dropout = p_dropout if p_dropout is not None else 0.0
         self.use_bias = use_bias
+        self.scale_factor = scale_factor
         self.dense = nn.Linear(
             self.nheads * self.emb_v_per_head, self.emb_dim, bias=use_bias
         )
@@ -187,6 +189,7 @@ class PagedMultiHeadAttention(nn.Module):
                 attn_mask=attn_mask,
                 dropout_p=self.p_dropout if self.training else 0.0,
                 is_causal=is_causal_mask,
+                scale=self.scale_factor,
             )
 
             if attn_algorithm:
