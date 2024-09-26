@@ -464,6 +464,19 @@ _8b_llama3_config = PagedLLaMAConfig(
     rope_theta=500000,
 )
 
+_8b_llama3_1_config = PagedLLaMAConfig(
+    src_vocab_size=128256,
+    emb_dim=4096,
+    norm_eps=1e-5,
+    nheads=32,
+    kvheads=8,
+    nlayers=32,
+    hidden_grow_factor=14336/4096,
+    multiple_of=1024,
+    max_expected_seq_len=131072,
+    rope_theta=500000,
+)
+
 _70b_llama3_config = PagedLLaMAConfig(
     src_vocab_size=128256,
     emb_dim=8192,
@@ -495,11 +508,32 @@ models.register_model(
 )
 
 models.register_model(
+    _architecture_name, "llama3.1.8b", _llama_factory_factory((_8b_llama3_1_config))
+)
+
+models.register_model(
     _architecture_name, "llama3.70b", _llama_factory_factory((_70b_llama3_config))
 )
 
 models.register_model(
     _architecture_name, "llama3.405b", _llama_factory_factory((_405b_llama3_config))
+)
+
+
+_allam_config = PagedLLaMAConfig(
+    src_vocab_size=61696,
+    emb_dim=5120,
+    norm_eps=1e-5,
+    nheads=40,
+    kvheads=40,
+    nlayers=40,
+    hidden_grow_factor=13824/5120,
+    max_expected_seq_len=4096,
+    rope_theta=10000,
+)
+
+models.register_model(
+    _architecture_name, "allam", _llama_factory_factory((_allam_config))
 )
 
 # calico
