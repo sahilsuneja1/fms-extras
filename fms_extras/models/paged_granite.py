@@ -34,13 +34,6 @@ from fms_extras.utils.cache.paged import (
 )
 
 
-# params emb_dim heads layers lr
-#  7B    4096    32    32     3.0E-04
-# 13B    5120    40    40     3.0E-04
-# 33B    6656    52    60     1.5.E-04
-# 65B    8192    64    80     1.5.E-04
-
-
 @dataclass
 class PagedGraniteConfig(ModelConfig):
     src_vocab_size: int = 32_000  # can be set by tokenizer
@@ -409,6 +402,9 @@ def _granite_factory_factory(config):
 
     return factory
 
+models.register_model(
+    _architecture_name, "8b", _granite_factory_factory(_8b_config)
+)
 
 def _hf_sd_to_fms_sd(hf_sd: Mapping) -> Mapping:
     replacements = [
