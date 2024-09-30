@@ -141,6 +141,7 @@ class PagedGraniteBlock(nn.Module):
         if self.config.p_dropout != 0:
             x = self.dropout(x)
         # residual connection
+        #print(f"SAHIL: self.config.residual_multiplier = {self.config.residual_multiplier}")
         x = x * self.config.residual_multiplier + residual
 
         # then we do FF and Add&Norm
@@ -241,6 +242,7 @@ class PagedGraniteHeadless(nn.Module):
             is_causal_mask = False
 
         x_in = self.shared(x_in)
+        #print(f"SAHIL: self.config.embedding_multiplier = {self.config.embedding_multiplier}")
         x_in = x_in * self.config.embedding_multiplier
 
         # this is the output cache for all the decoder layers
@@ -362,6 +364,7 @@ class PagedGranite(nn.Module):
             embeds = embeds[:, -1, :]
 
         preds = self.head(embeds, reverse=True)
+        #print(f"SAHIL: self.config.logits_scaling = {self.config.logits_scaling}")
         preds = preds / self.config.logits_scaling
 
         out = [preds]

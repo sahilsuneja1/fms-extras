@@ -182,6 +182,7 @@ class PagedMultiHeadAttention(nn.Module):
                 torch.backends.cuda.enable_mem_efficient_sdp(use_mem_efficient)
                 torch.backends.cuda.enable_math_sdp(use_math)
 
+            #print(f"SAHIL: scale_factor = {self.scale_factor}")
             attn = F.scaled_dot_product_attention(
                 queries,
                 keys_e,

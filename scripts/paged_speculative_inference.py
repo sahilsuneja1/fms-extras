@@ -11,6 +11,7 @@ from torch import distributed as dist
 
 import fms_extras.models.paged_gpt_bigcode
 import fms_extras.models.paged_llama
+import fms_extras.models.paged_granite
 from fms_extras.models.speculator import MLPSpeculator
 from fms_extras.utils.generation import paged_generate, speculative_generate
 
@@ -138,13 +139,14 @@ if args.device_type == "cuda":
 else:
     device = torch.device(args.device_type)
 
-torch.set_default_dtype(torch.half)
+torch.set_default_dtype(torch.bfloat16)
 
 # requires setting environment variable: `CUBLAS_WORKSPACE_CONFIG=:4096:8`
 if args.deterministic:
     torch.use_deterministic_algorithms(True)
 
-if args.distributed:
+#if args.distributed:
+if True:
     dist.init_process_group()
     torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
 
@@ -164,7 +166,8 @@ model = get_model(
     checkpoint_sharding=args.checkpoint_sharding,
     device_type=args.device_type,
     source=args.model_source,
-    distributed_strategy=distr_param,
+    #distributed_strategy=distr_param,
+    distributed_strategy="fsdp",
     group=dist.group.WORLD,
 )
 decode_model = None
@@ -224,7 +227,7 @@ kv_cache_manager = PagedKVCacheManager(
 print("cache initialization complete on rank", local_rank)
 
 add_special_tokens = tokenizer.bos_token_id != tokenizer.eos_token_id
-
+add_special_tokens = False
 
 def ids_for_prompt(prompt):
     tokens = tokenizer.tokenize(prompt)
