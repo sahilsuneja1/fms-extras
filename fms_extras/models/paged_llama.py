@@ -24,8 +24,10 @@ from fms.modules.tp import TPModule
 from fms.utils import serialization
 from fms.utils.activation import str_to_activation
 from fms.utils.config import ModelConfig
+from fms.utils.serialization import _legacy_mlp_glu_unfused_to_fused_adapter
 from torch._C._distributed_c10d import ProcessGroup
 
+from fms_extras.modules.attention import PagedMultiHeadAttention
 from fms_extras.utils.cache.paged import (
     PagedAttentionCacheData,
     PagedAttentionCacheDataLayer,
@@ -55,346 +57,9 @@ class PagedLLaMAConfig(ModelConfig):
     max_expected_seq_len: int = 4096
     ntk_scaling: bool = False
     rope_theta: int = 10_000
-
-
-class PagedMultiHeadAttention(nn.Module):
-    """
-    Performs multi-headed self- or cross-attention, with optional attention masking.
-
-    Note: this class extends MultiHeadAttention to enable tensor parallel support
-    """
-
-    def __init__(
-        self,
-        emb_dim,
-        emb_kq,
-        emb_v,
-        nheads,
-        kvheads,
-        p_dropout=None,
-        use_bias=False,
-        position_encoder: Optional[PositionEncoder] = None,
-        gain=1,
-    ):
-        super(PagedMultiHeadAttention, self).__init__()
-        self.nheads = nheads
-        self.kvheads = kvheads
-        self.emb_dim = emb_dim
-        self.emb_kq_per_head = emb_kq
-        self.emb_v_per_head = emb_v
-        self.p_dropout = p_dropout if p_dropout is not None else 0.0
-        self.use_bias = use_bias
-        self.dense = nn.Linear(
-            self.nheads * self.emb_v_per_head, self.emb_dim, bias=use_bias
-        )
-
-        self.splits = [
-            self.nheads * self.emb_kq_per_head,
-            self.kvheads * self.emb_kq_per_head,
-            self.kvheads * self.emb_v_per_head,
-        ]
-
-        self.qkv_fused = nn.Linear(
-            self.emb_dim,
-            sum(self.splits),
-            bias=use_bias,
-        )
-
-        if self.p_dropout:
-            self.attn_dropout = nn.Dropout(self.p_dropout)
-        self.position_encoder = position_encoder
-        # Avoiding graph breaks
-        self.previous_flash: bool = torch.backends.cuda.flash_sdp_enabled()
-        self.previous_mem_efficient: bool = (
-            torch.backends.cuda.mem_efficient_sdp_enabled()
-        )
-        self.previous_math: bool = torch.backends.cuda.math_sdp_enabled()
-
-    def reset_parameters(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02)
-                if self.use_bias:
-                    m.bias.data.zero_()
-
-    def to_tp(self, group: ProcessGroup) -> "TPPagedMultiHeadAttention":
-        return TPPagedMultiHeadAttention.import_module(self, group)
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        attn_algorithm: Optional[str] = None,
-        cache_data_layer: Optional[PagedAttentionCacheDataLayer] = None,
-        use_cache: bool = False,
-        is_self: bool = True,
-        is_causal_mask: bool = False,
-    ):
-        """
-        cache_data_layer: PagedAttentionCacheDataLayer, optional
-            A single layer of the cache (default is None)
-        use_cache: bool
-            if True, the kv states for self/cross attention will be saved, otherwise they will not be saved
-        is_self: bool
-            if True, this will perform self attention, otherwise this will perform cross attention. Note: This will
-            only be used in the case that use_cache=True. This may be removed in future
-
-        Returns
-        -------
-        tensor or tuple
-            If use_cache=False, only the hidden state will be returned as a tensor. If use_cache=True, a tuple will be
-            returned in the form (hidden_state, cache) where hidden_state is a tensor and cache is of the form specified
-            in past_key_value_state
-        """
-
-        # q, k, v: batch_size x seq_len x emb_dim
-        # mask: batch_size x seq_len x seq_len
-        batch_size, q_len, _ = q.size()
-        position_ids = (
-            None if cache_data_layer is None else cache_data_layer.position_ids
-        )
-
-        queries, keys, values = self.qkv_fused(q).split(self.splits, dim=-1)
-
-        queries = queries.view(batch_size, q_len, self.nheads, self.emb_kq_per_head)
-        keys = keys.view(batch_size, q_len, self.kvheads, self.emb_kq_per_head)
-        values = values.view(batch_size, q_len, self.kvheads, self.emb_v_per_head)
-
-        # You want to apply rotary embeddings pre-cache
-        if self.position_encoder is not None:
-            queries, keys = self.position_encoder.adjusted_qk(
-                queries,
-                keys,
-                position_ids,  # type: ignore
-                None,
-                use_cache,
-            )
-
-        # store the values in kv-cache
-        if use_cache and cache_data_layer:
-            keys, values = cache_data_layer.store(keys, values)
-
-        if use_cache and cache_data_layer and cache_data_layer.is_filled():
-            attn = cache_data_layer.attend(queries)
-        # otherwise we always fall back into SDPA as this is either a prompt or it is a single contiguous cache
-        else:
-            queries = queries.transpose(2, 1)
-            keys = keys.transpose(2, 1)
-            values = values.transpose(2, 1)
-
-            # Merge rel pos bias and mask into single float mask
-            if mask is not None:
-                # Our expected mask format is bs x q_len x k_len, so to make it broadcastable
-                # we need to create the nheads dimension
-                while len(mask.size()) != 4:  # expects bs (x nheads) x q_len x kv_len
-                    mask = mask.unsqueeze(1)
-
-            if self.position_encoder is not None:
-                attn_mask = self.position_encoder.adjusted_mask(
-                    mask, queries, keys, position_ids, use_cache  # type: ignore
-                )
-            else:
-                attn_mask = mask
-
-            # Expand kv so black-box attn will work
-            expansion = self.nheads // self.kvheads
-            # k/v: b h l d
-            if expansion != 1:
-                keys_e = (
-                    keys.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-                )
-                values_e = (
-                    values.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-                )
-            else:
-                keys_e = keys
-                values_e = values
-
-            if attn_algorithm:
-                # Pick which fused attn kernels will run.
-                use_flash = attn_algorithm == "flash"
-                use_mem_efficient = attn_algorithm == "mem"
-                use_math = attn_algorithm == "math"
-
-                torch.backends.cuda.enable_flash_sdp(use_flash)
-                torch.backends.cuda.enable_mem_efficient_sdp(use_mem_efficient)
-                torch.backends.cuda.enable_math_sdp(use_math)
-
-            attn = F.scaled_dot_product_attention(
-                queries,
-                keys_e,
-                values_e,
-                attn_mask=attn_mask,
-                dropout_p=self.p_dropout if self.training else 0.0,
-                is_causal=is_causal_mask,
-            )
-
-            if attn_algorithm:
-                torch.backends.cuda.enable_flash_sdp(self.previous_flash)
-                torch.backends.cuda.enable_mem_efficient_sdp(
-                    self.previous_mem_efficient
-                )
-                torch.backends.cuda.enable_math_sdp(self.previous_math)
-
-            # attn: bs x seq_len x nheads*emb_v_per_head
-            # attn: b x h x qlen x ds
-            # attn after permute: b x qlen x h x ds
-            # b x qlen x (d)
-            attn = attn.transpose(2, 1).contiguous()
-
-        attn = attn.view(batch_size, q_len, self.nheads * self.emb_v_per_head)
-
-        out = self.dense(attn)
-
-        # if use_cache=True, we return the hidden_state as well as the kv cache
-        if use_cache and cache_data_layer:
-            # note: needed to add this check to return the data_layer as it fails compile otherwise
-            return out, cache_data_layer.data_layer
-        else:
-            return out
-
-
-class TPPagedMultiHeadAttention(PagedMultiHeadAttention, TPModule):
-    def __init__(
-        self,
-        emb_dim,
-        emb_kq,
-        emb_v,
-        nheads,
-        kvheads,
-        p_dropout=None,
-        use_bias=False,
-        position_encoder: Optional[PositionEncoder] = None,
-        gain=1,
-        group: Optional[ProcessGroup] = None,
-    ):
-        assert torch.distributed.is_initialized()
-
-        rank, world_size = distributed.rank_and_world(group)
-        assert (
-            nheads % world_size == 0
-        ), "The number of heads must be divisible by world size"
-        PagedMultiHeadAttention.__init__(
-            self,
-            emb_dim,
-            emb_kq,
-            emb_v,
-            nheads // world_size,
-            (kvheads // world_size) if kvheads > 1 else kvheads,
-            p_dropout,
-            use_bias,
-            position_encoder,
-            gain,
-        )
-        self.pre_tp_nheads = nheads
-        self.pre_tp_kvheads = kvheads
-        self.setup_tp(rank, world_size)
-
-    def load_weights(
-        self,
-        tensor_values: Dict[str, torch.Tensor],
-    ):
-        # 1. Grab the weights from tensor_values
-        used_keys: Set[str] = set()
-        qkv_weight = self._get_sd_weight(
-            tensor_values, used_keys, ["qkv_fused", "weight"]
-        )
-        dense_weight = self._get_sd_weight(
-            tensor_values, used_keys, ["dense", "weight"]
-        )
-        if self.use_bias:
-            qkv_bias = self._get_sd_weight(
-                tensor_values, used_keys, ["qkv_fused", "bias"]
-            )
-            dense_bias = self._get_sd_weight(
-                tensor_values, used_keys, ["dense", "bias"]
-            )
-
-        # 2. Raise exceptions
-        if len(tensor_values) > (4 if self.use_bias else 2):
-            unused_keys = set(tensor_values.keys()).difference(used_keys)
-            raise AttributeError(f"Unused weight(s): {', '.join(unused_keys)}")
-
-        # 3. Load and shard the weights
-        # The number in max_partition_sizes will signify the largest world size
-        # til we need to duplicate.  For instance if we have nheads=16 and
-        # world_size=32, then first 2 ranks will get first 1/16th of query
-        self.sharded_copy(
-            self.qkv_fused.weight,
-            qkv_weight,
-            0,
-            [self.pre_tp_nheads, self.pre_tp_kvheads, self.pre_tp_kvheads],
-        )
-        self.sharded_copy(self.dense.weight, dense_weight, 1, [self.world_size])
-        if self.use_bias:
-            self.sharded_copy(
-                self.qkv_fused.bias,
-                qkv_bias,
-                0,
-                [self.pre_tp_nheads, self.pre_tp_kvheads, self.pre_tp_kvheads],
-            )
-            self.sharded_copy(self.dense.bias, dense_bias, 1, [self.world_size], False)
-
-    @staticmethod
-    def import_module(
-        mha: PagedMultiHeadAttention, group: ProcessGroup
-    ) -> "TPPagedMultiHeadAttention":
-        tp_mha = TPPagedMultiHeadAttention(
-            emb_dim=mha.emb_dim,
-            emb_kq=mha.emb_kq_per_head,
-            emb_v=mha.emb_v_per_head,
-            nheads=mha.nheads,
-            kvheads=mha.kvheads,
-            p_dropout=mha.p_dropout,
-            use_bias=mha.use_bias,
-            position_encoder=mha.position_encoder,
-            group=group,
-        )
-        return tp_mha
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        attn_algorithm: Optional[str] = None,
-        cache_data_layer: Optional[PagedAttentionCacheDataLayer] = None,
-        use_cache: bool = False,
-        is_self: bool = True,
-        is_causal_mask: bool = False,
-    ):
-        """
-        Check MultiHeadAttention for up-to-date arguments and docs
-        """
-
-        q_par = copy_to_tensor_model_parallel_region(q)
-        k_par = copy_to_tensor_model_parallel_region(k)
-        v_par = copy_to_tensor_model_parallel_region(v)
-
-        out_par = PagedMultiHeadAttention.forward(
-            self,
-            q_par,
-            k_par,
-            v_par,
-            mask,
-            attn_algorithm,
-            cache_data_layer,
-            use_cache,
-            is_self,
-            is_causal_mask,
-        )
-
-        # if use_cache=True, we return the hidden_state as well as the kv cache.
-        # We only reduce the output, and keep the cache thread-local
-        if use_cache:
-            out = reduce_from_tensor_model_parallel_region(out_par[0])
-            return out, out_par[1]
-        else:
-            out = reduce_from_tensor_model_parallel_region(out_par)
-            return out
+    attn_bias: bool = False
+    mlp_bias: bool = False
+    tie_heads: bool = False
 
 
 class PagedLLaMABlock(nn.Module):
@@ -434,7 +99,7 @@ class PagedLLaMABlock(nn.Module):
             self.config.nheads,
             kvheads,
             p_dropout=self.config.p_dropout,
-            use_bias=False,
+            use_bias=self.config.attn_bias,
             position_encoder=rotary_emb,
         )
         self.ff_sub_layer = GatedLinearUnit(
@@ -443,7 +108,7 @@ class PagedLLaMABlock(nn.Module):
             multiple_of=self.config.multiple_of,
             activation_fn=str_to_activation(self.config.activation_fn),
             p_dropout=self.config.p_dropout,
-            use_bias=False,
+            use_bias=self.config.mlp_bias,
         )
 
         if self.config.p_dropout != 0:
@@ -509,7 +174,7 @@ class PagedLLaMAHeadless(nn.Module):
             padding_idx=self.config.pad_id,
             abs_pos=False,
             reversible=True,
-            tie_weights=False,
+            tie_weights=self.config.tie_heads,
             bias=False,
         )
         self.shared = self.distributed_strategy.distribute_module(shared)
@@ -731,13 +396,26 @@ _13b_code_config = PagedLLaMAConfig(
 )
 # todo: add 35B config
 
+_34b_code_config = PagedLLaMAConfig(
+    emb_dim=8192,
+    nheads=64,
+    kvheads=8,
+    nlayers=48,
+    hidden_grow_factor=22016 / 8192,
+    src_vocab_size=32000,
+    max_expected_seq_len=16384,
+    rope_theta=1_000_000,
+)
+# todo: add 35B config
+
 _70b_config = PagedLLaMAConfig(
     emb_dim=8192,
     multiple_of=4096,
     nheads=64,
     kvheads=8,
     nlayers=80,
-    hidden_grow_factor=(1.3 * 8 / 3),
+    #hidden_grow_factor=(1.3 * 8 / 3),
+    hidden_grow_factor=28672/8192,
 )
 
 _architecture_name = "paged_llama"
@@ -766,6 +444,9 @@ models.register_model(_architecture_name, "13b", _llama_factory_factory(_13b_con
 models.register_model(
     _architecture_name, "13b.code", _llama_factory_factory(_13b_code_config)
 )
+models.register_model(
+    _architecture_name, "34b.code", _llama_factory_factory(_34b_code_config)
+)
 models.register_model(_architecture_name, "70b", _llama_factory_factory(_70b_config))
 
 # llama3
@@ -780,6 +461,20 @@ _8b_llama3_config = PagedLLaMAConfig(
     hidden_grow_factor=3.5,
     multiple_of=1024,
     max_expected_seq_len=8192,
+    rope_theta=500000,
+)
+
+_8b_llama3_1_config = PagedLLaMAConfig(
+    src_vocab_size=128256,
+    emb_dim=4096,
+    norm_eps=1e-5,
+    nheads=32,
+    kvheads=8,
+    nlayers=32,
+    hidden_grow_factor=14336/4096,
+    multiple_of=1024,
+    max_expected_seq_len=131072,
+    rope_theta=500000,
 )
 
 _70b_llama3_config = PagedLLaMAConfig(
@@ -795,13 +490,35 @@ _70b_llama3_config = PagedLLaMAConfig(
     rope_theta=500000,
 )
 
+_405b_llama3_config = PagedLLaMAConfig(
+    src_vocab_size=128256,
+    emb_dim=16384,
+    norm_eps=1e-5,
+    nheads=128,
+    kvheads=16,
+    nlayers=126,
+    hidden_grow_factor=53248/16384,
+    multiple_of=4096,
+    max_expected_seq_len=16384,
+    rope_theta=500000,
+)
+
 models.register_model(
     _architecture_name, "llama3.8b", _llama_factory_factory((_8b_llama3_config))
 )
 
 models.register_model(
+    _architecture_name, "llama3.1.8b", _llama_factory_factory((_8b_llama3_1_config))
+)
+
+models.register_model(
     _architecture_name, "llama3.70b", _llama_factory_factory((_70b_llama3_config))
 )
+
+models.register_model(
+    _architecture_name, "llama3.405b", _llama_factory_factory((_405b_llama3_config))
+)
+
 
 _8b_bsc_config = PagedLLaMAConfig(
     src_vocab_size=256000,
@@ -818,6 +535,67 @@ _8b_bsc_config = PagedLLaMAConfig(
 models.register_model(
     _architecture_name, "8b.bsc", _llama_factory_factory((_8b_bsc_config))
 )
+
+_allam_config = PagedLLaMAConfig(
+    src_vocab_size=61696,
+    emb_dim=5120,
+    norm_eps=1e-5,
+    nheads=40,
+    kvheads=40,
+    nlayers=40,
+    hidden_grow_factor=13824/5120,
+    max_expected_seq_len=4096,
+    rope_theta=10000,
+)
+
+models.register_model(
+    _architecture_name, "allam", _llama_factory_factory((_allam_config))
+)
+
+# calico
+
+_8b_calico_code_config = PagedLLaMAConfig(
+    src_vocab_size=49152,
+    emb_dim=4096,
+    nheads=32,
+    kvheads=8,
+    nlayers=36,
+    pad_id=0,
+    hidden_grow_factor=14336 / 4096,
+    multiple_of=1,
+    max_expected_seq_len=4096,
+    attn_bias=True,
+    mlp_bias=True,
+    tie_heads=True,
+)
+
+models.register_model(
+    _architecture_name,
+    "calico.8b.code",
+    _llama_factory_factory((_8b_calico_code_config)),
+)
+
+_3b_calico_code_config = PagedLLaMAConfig(
+    src_vocab_size=49152,
+    emb_dim=2560,
+    nheads=32,
+    kvheads=32,
+    nlayers=32,
+    pad_id=0,
+    hidden_grow_factor=10240 / 2560,
+    multiple_of=1,
+    max_expected_seq_len=2048,
+    attn_bias=True,
+    mlp_bias=True,
+    tie_heads=True,
+)
+
+models.register_model(
+    _architecture_name,
+    "calico.3b.code",
+    _llama_factory_factory((_3b_calico_code_config)),
+)
+
 
 def _rename_weights_to_fms(orig_sd):
     replacements = [
@@ -859,6 +637,8 @@ def _rename_weights_to_fms(orig_sd):
                 re.sub(r"attn.(query|key|value)", "attn.qkv_fused", new_name)
             ] = torch.cat([orig_sd[w] for w in unfused_weights], dim=0)
 
+    new_sd = _legacy_mlp_glu_unfused_to_fused_adapter(new_sd)
+
     return new_sd
 
 
@@ -891,7 +671,7 @@ def _hf_sd_to_fms_sd(hf_sd: Mapping) -> Mapping:
             "attn.query" in new_name
             or "attn.key" in new_name
             or "attn.value" in new_name
-        ):
+        ) and "weight" in new_name:
             del new_sd[new_name]
             unfused_weights = [
                 re.sub(r"self_attn\.[kvq]_proj", "self_attn.q_proj", name),
@@ -909,10 +689,17 @@ def _hf_sd_to_fms_sd(hf_sd: Mapping) -> Mapping:
             # q=0, k=1
             for unfused_weight_key in unfused_weights[:2]:
                 temp = raw_mapping[unfused_weight_key]
+
+                emb_dim = param.size(1)
+                if emb_dim == 2560:
+                    head_size = 80
+                else:
+                    head_size = 128
+
                 # nheads is used in the transformation required for hf->fms
                 # here we are using 128 as this value fits with all popular models
                 #   7B, 13B, 70B to recover the number of heads
-                nheads = int(temp.size(0) / 128)
+                nheads = int(temp.size(0) / head_size)
 
                 temp = (
                     temp.view(nheads, 2, -1, temp.size(1))
@@ -925,36 +712,64 @@ def _hf_sd_to_fms_sd(hf_sd: Mapping) -> Mapping:
             new_sd[
                 re.sub(r"attn.(query|key|value)", "attn.qkv_fused", new_name)
             ] = torch.cat([raw_mapping[w] for w in unfused_weights], dim=0)
-
-    return new_sd
-
-
-def _rename_fms_weights_to_fms_paged(orig_sd):
-    new_sd = {}
-    for name, param in orig_sd.items():
-        new_name = f"headless_model.{name}"
-        new_sd[new_name] = param
-
-        # llama in meta has unfused qkv attn weights, so these weights must be converted to fused weights in fms
-        if (
+        elif (
             "attn.query" in new_name
             or "attn.key" in new_name
             or "attn.value" in new_name
-        ):
+        ) and "bias" in new_name:
+            del new_sd[new_name]
             unfused_weights = [
-                re.sub(r"attn.(query|key|value)", "attn.query", name),
-                re.sub(r"attn.(query|key|value)", "attn.key", name),
-                re.sub(r"attn.(query|key|value)", "attn.value", name),
+                re.sub(r"self_attn\.[kvq]_proj", "self_attn.q_proj", name),
+                re.sub(r"self_attn\.[kvq]_proj", "self_attn.k_proj", name),
+                re.sub(r"self_attn\.[kvq]_proj", "self_attn.v_proj", name),
             ]
-            missing_weights = [w for w in unfused_weights if w not in orig_sd.keys()]
+            missing_weights = [w for w in unfused_weights if w not in hf_sd.keys()]
             if len(missing_weights) != 0:
                 raise ValueError(
                     f"The following weights are required for properly fusing: {missing_weights}"
                 )
 
+            raw_mapping = {w: hf_sd[w] for w in unfused_weights}
+
+            # q=0, k=1
+            for unfused_weight_key in unfused_weights[:2]:
+                temp = raw_mapping[unfused_weight_key]
+
+                weight_name = name.replace("bias", "weight")
+                emb_dim = hf_sd[weight_name].size(1)
+                if emb_dim == 2560:
+                    head_size = 80
+                else:
+                    head_size = 128
+
+                # nheads is used in the transformation required for hf->fms
+                # here we are using 128 as this value fits with all popular models
+                #   7B, 13B, 70B to recover the number of heads
+                nheads = int(temp.size(0) / head_size)
+
+                temp = temp.view(nheads, 2, -1).transpose(1, 2).reshape(*temp.size())
+
+                raw_mapping[unfused_weight_key] = temp
+
             new_sd[
                 re.sub(r"attn.(query|key|value)", "attn.qkv_fused", new_name)
-            ] = torch.cat([orig_sd[w] for w in unfused_weights], dim=0)
+            ] = torch.cat([raw_mapping[w] for w in unfused_weights], dim=0)
+
+    new_sd = _legacy_mlp_glu_unfused_to_fused_adapter(new_sd)
+
+    return new_sd
+
+
+def _rename_fms_weights_to_fms_paged(orig_sd):
+    replacements = [
+        (r"attn\.in_proj\.qkv_fused\.weight", "attn.qkv_fused.weight"),
+    ]
+    new_sd = {}
+    for name, param in orig_sd.items():
+        new_name = f"headless_model.{name}"
+        for pattern, repl in replacements:
+            new_name = re.sub(pattern, repl, new_name)
+        new_sd[new_name] = param
 
     return new_sd
 
