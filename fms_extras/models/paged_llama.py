@@ -520,6 +520,22 @@ models.register_model(
 )
 
 
+_8b_bsc_config = PagedLLaMAConfig(
+    src_vocab_size=256000,
+    emb_dim=4096,
+    norm_eps=1e-6,
+    nheads=32,
+    kvheads=8,
+    nlayers=32,
+    hidden_grow_factor=11008/4096,
+    max_expected_seq_len=8192,
+    rope_theta=10000,
+)
+
+models.register_model(
+    _architecture_name, "8b.bsc", _llama_factory_factory((_8b_bsc_config))
+)
+
 _allam_config = PagedLLaMAConfig(
     src_vocab_size=61696,
     emb_dim=5120,
